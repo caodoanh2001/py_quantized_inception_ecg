@@ -34,6 +34,8 @@ To run the NumPy-only inference:
 python quantized_model.py
 ```
 
+Accuracy on the test set should be 98.11%
+
 ## ⚖️ Optional: TensorFlow Lite Inference (for Verification)
 If you'd like to compare results with the original .tflite model, you can use the TensorFlow Lite interpreter as a reference:
 
