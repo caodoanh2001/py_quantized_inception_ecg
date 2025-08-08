@@ -94,13 +94,6 @@ def perform_quantized_conv1d(input_int8, weights_int8, biases_int32,
     # Do not apply ReLU or requantization here — return int32
     return output_accumulator
 
-def perform_quantized_add(input_a_int8, input_b_int8, output_scale, output_zero_point):
-    # Promote to int32 to avoid overflow during addition
-    sum_adjusted = input_a_int8.astype(np.int32) + input_b_int8.astype(np.int32) - output_zero_point
-    # Clip to int8 range [-128, 127]
-    output_int8 = np.clip(sum_adjusted, -128, 127).astype(np.int8)
-    return output_int8
-
 def requantize_int32_with_relu(accumulator_int32, input_scale, input_zero_point, weight_scales, output_scales, output_zero_points):
     """
     Requantizes an int32 accumulator to int8 with per-channel scales, applying ReLU after scaling.
@@ -183,17 +176,25 @@ def perform_max_pooling1d(input_array, pool_size=2, stride=2, padding='valid'):
 
     return output_array
 
-def perform_quantized_add(input_a_int8, scale_a, zero_point_a, input_b_int8, scale_b, zero_point_b, output_scale, output_zero_point):
-    # Step 1: Dequantize both to float32
-    dequant_a = scale_a * (input_a_int8.astype(np.float32) - zero_point_a)
-    dequant_b = scale_b * (input_b_int8.astype(np.float32) - zero_point_b)
+def perform_quantized_add(input_a_int8, scale_a, zp_a,
+                              input_b_int8, scale_b, zp_b,
+                              output_scale, output_zp):
+    # Convert inputs to int32
+    a_int32 = input_a_int8.astype(np.int32) - zp_a
+    b_int32 = input_b_int8.astype(np.int32) - zp_b
 
-    # Step 2: Add in float
-    added_float = dequant_a + dequant_b
+    # Compute effective scales (multiplier) for each input
+    scale_a_eff = scale_a / output_scale
+    scale_b_eff = scale_b / output_scale
 
-    # Step 3: Requantize to int8 with output scale and zero point
-    added_quant = np.round(added_float / output_scale + output_zero_point)
-    return np.clip(added_quant, -128, 127).astype(np.int8)
+    # Multiply with effective scale and add (still float at this point)
+    result = a_int32 * scale_a_eff + b_int32 * scale_b_eff
+
+    # Round and add output zp
+    result = np.round(result + output_zp).astype(np.int32)
+
+    # Clip to int8 range
+    return np.clip(result, -128, 127).astype(np.int8)
 
 def perform_quantized_global_avg_pool1d(input_int8, input_scale, input_zero_point, output_scale, output_zero_point):
     # Step 1: dequantize
