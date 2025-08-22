@@ -5,8 +5,8 @@ import math
 from model_layer_names import dict_all_layer_names
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-
-def quantize_float_to_int8(input_array, scale, zero_point):
+    
+def quantize(x, scale, zp):
     """
     Quantizes a floating-point array to int8 using the provided scale and zero point.
 
@@ -15,16 +15,16 @@ def quantize_float_to_int8(input_array, scale, zero_point):
     nearest integer, and clips the result to the range [-128, 127] to fit int8.
 
     Parameters:
-    - input_array (np.ndarray): The input array of floating-point values to quantize.
+    - x (np.ndarray): The input array of floating-point values to quantize.
     - scale (float or np.ndarray): The scaling factor(s) for quantization. Can be a scalar or per-channel.
-    - zero_point (float or np.ndarray): The zero point(s) for quantization. Can be a scalar or per-channel.
+    - zp (float or np.ndarray): The zero point(s) for quantization. Can be a scalar or per-channel.
 
     Returns:
-    - np.ndarray: The quantized int8 array with the same shape as input_array.
+    - np.ndarray: The quantized int8 array with the same shape as x.
     """
-    return np.clip(np.round(input_array / scale + zero_point), -128, 127).astype(np.int8)
+    return np.clip(np.round(x / scale + zp), -128, 127).astype(np.int8)
 
-def requantize_int32_to_int8(accumulator_int32, input_scale, weight_scale, output_scale, output_zero_point):
+def requantize(x_int32, input_scale, weight_scale, output_scale, output_zp):
     """
     Requantizes an int32 accumulator to int8 for the next layer using combined scales and zero point.
 
@@ -33,68 +33,115 @@ def requantize_int32_to_int8(accumulator_int32, input_scale, weight_scale, outpu
     applies it to the int32 values, adds the output zero point, rounds, and clips to int8 range.
 
     Parameters:
-    - accumulator_int32 (np.ndarray): The input int32 array (typically accumulator from convolution).
+    - x_int32 (np.ndarray): The input int32 array (typically accumulator from convolution).
     - input_scale (float): The scale of the input activations.
     - weight_scale (float): The scale of the weights.
     - output_scale (float): The desired output scale.
-    - output_zero_point (int): The desired output zero point.
+    - output_zp (int): The desired output zero point.
 
     Returns:
     - np.ndarray: The requantized int8 array.
     """
-    combined_scale = (input_scale * weight_scale) / output_scale
-    return np.clip(np.round(accumulator_int32 * combined_scale) + output_zero_point, -128, 127).astype(np.int8)
+    scale = (input_scale * weight_scale) / output_scale
+    return np.clip(np.round(x_int32 * scale) + output_zp, -128, 127).astype(np.int8)
 
-def perform_quantized_conv1d(input_int8, weights_int8, biases_int32, 
-                             input_scale, input_zero_point, 
-                             weight_scales, weight_zero_points):
+def quantized_conv1d(x_int8, w_q, b_q, 
+                          input_scale, input_zp, 
+                          weight_scales, weight_zps,
+                          stride=1):
     """
-    Performs a quantized 1D convolution using int8 inputs and weights, accumulating in int32.
+    Quantized 1D convolution (int8 inputs & weights, int32 accumulators) with
+    TF-like "same" padding and configurable stride.
 
-    This function simulates a depthwise or pointwise convolution in quantized form. It pads the input,
-    performs the convolution in a nested loop, subtracting zero points for inputs and weights per-channel
-    if applicable, adds bias, and returns the int32 accumulator without ReLU or requantization.
+    Shapes:
+      x_int8: (B, W, C_in)          int8
+      w_q:    (K, C_in, C_out)      int8
+      b_q:    (C_out,)              int32 (or castable)
+      input_zp:  scalar or (C_in,)  int
+      weight_zps: (C_out,)          int
 
-    Parameters:
-    - input_int8 (np.ndarray): Quantized int8 input activations with shape (B, W, C_in).
-    - weights_int8 (np.ndarray): Quantized int8 weights with shape (K, C_in, C_out).
-    - biases_int32 (np.ndarray): Quantized biases with shape (C_out,).
-    - input_scale (float or np.ndarray): Input activation scale(s).
-    - input_zero_point (int or np.ndarray): Input activation zero point(s), can be per-channel.
-    - weight_scales (float or np.ndarray): Weight scale(s), per-output-channel.
-    - weight_zero_points (int or np.ndarray): Weight zero point(s), per-output-channel.
+    No ReLU or requantization is applied; returns raw int32 accumulators.
 
-    Returns:
-    - np.ndarray: Int32 accumulator output with shape (B, W, C_out).
+    Output:
+      out: (B, ceil(W/stride), C_out)
     """
-    batch_size, width, channels_in = input_int8.shape
-    kernel_size, channels_in_weights, channels_out = weights_int8.shape
-    assert channels_in == channels_in_weights
+    # Basic checks
+    assert stride >= 1, "stride must be >= 1"
+    B, W, C_in = x_int8.shape
+    K, C_in_w, C_out = w_q.shape
+    assert C_in == C_in_w, "Input channels must match weight's C_in."
 
-    padding_size = kernel_size // 2
-    padded_input = np.pad(input_int8, ((0, 0), (padding_size, padding_size), (0, 0)), 'constant', constant_values=input_zero_point)
+    # Normalize ZPs
+    input_zp_arr = np.array(input_zp, dtype=np.int32).reshape(-1)
+    if input_zp_arr.size not in (1, C_in):
+        raise ValueError("input_zp must be a scalar or length C_in.")
+    weight_zps_arr = np.array(weight_zps, dtype=np.int32).reshape(-1)
+    assert weight_zps_arr.size == C_out, "weight_zps must be per-output-channel."
 
-    output_accumulator = np.zeros((batch_size, width, channels_out), dtype=np.int32)
+    # --- SAME padding math (1D) ---
+    # Desired output width
+    W_out = math.ceil(W / stride)
+    # Total padding required to achieve W_out with kernel K and stride
+    total_pad = max(0, (W_out - 1) * stride + K - W)
+    pad_left = total_pad // 2
+    pad_right = total_pad - pad_left
 
-    for b in range(batch_size):
-        for w in range(width):
-            for o in range(channels_out):
+    # Create padded input, filling padding with input_zp so (x - zp) = 0 there.
+    x_padded = np.zeros((B, W + pad_left + pad_right, C_in), dtype=np.int8)
+    # Fill the middle with the actual input
+    x_padded[:, pad_left:pad_left + W, :] = x_int8
+
+    # Fill left/right pads with input zero-points (scalar or per-channel)
+    if input_zp_arr.size == 1:
+        val = np.int8(input_zp_arr[0])
+        if pad_left > 0:
+            x_padded[:, :pad_left, :] = val
+        if pad_right > 0:
+            x_padded[:, -pad_right:, :] = val
+    else:
+        # per-channel
+        if pad_left > 0:
+            x_padded[:, :pad_left, :] = np.int8(input_zp_arr[np.newaxis, np.newaxis, :])
+        if pad_right > 0:
+            x_padded[:, -pad_right:, :] = np.int8(input_zp_arr[np.newaxis, np.newaxis, :])
+
+    out = np.zeros((B, W_out, C_out), dtype=np.int32)
+
+    # Convolution
+    for b in range(B):
+        for w_out_idx in range(W_out):
+            in_w_start = w_out_idx * stride
+            # window covers indices [in_w_start, in_w_start + K)
+            for o in range(C_out):
                 acc = 0
-                for k in range(kernel_size):
-                    for c in range(channels_in):
-                        if len(input_zero_point) > 1:
-                            input_val = padded_input[b, w + k, c].astype(np.int32) - input_zero_point[c]  # handles per-channel zp
-                        else:
-                            input_val = padded_input[b, w + k, c].astype(np.int32) - input_zero_point[0]
-                        weight_val = weights_int8[k, c, o].astype(np.int32) - weight_zero_points[o]
-                        acc += input_val * weight_val
-                acc += biases_int32[o]  # scalar bias
-                output_accumulator[b, w, o] = acc
+                w_zp_o = weight_zps_arr[o]
+                for k in range(K):
+                    iw = in_w_start + k
+                    if input_zp_arr.size == 1:
+                        izp = input_zp_arr[0]
+                        for c in range(C_in):
+                            x_val = np.int32(x_padded[b, iw, c]) - izp
+                            w_val = np.int32(w_q[k, c, o]) - w_zp_o
+                            acc += x_val * w_val
+                    else:
+                        # per-channel input zp
+                        for c in range(C_in):
+                            x_val = np.int32(x_padded[b, iw, c]) - np.int32(input_zp_arr[c])
+                            w_val = np.int32(w_q[k, c, o]) - w_zp_o
+                            acc += x_val * w_val
+                acc += np.int32(b_q[o])
+                out[b, w_out_idx, o] = acc
 
-    # Do not apply ReLU or requantization here — return int32
-    return output_accumulator
+    return out
 
-def requantize_int32_with_relu(accumulator_int32, input_scale, input_zero_point, weight_scales, output_scales, output_zero_points):
+def quantized_add(a_int8, b_int8, out_scale, out_zp):
+    # Promote to int32 to avoid overflow during addition
+    sum_adjusted = a_int8.astype(np.int32) + b_int8.astype(np.int32) - out_zp
+    # Clip to int8 range [-128, 127]
+    out_int8 = np.clip(sum_adjusted, -128, 127).astype(np.int8)
+    return out_int8
+
+def requantize_with_relu(x_int32, input_scale, input_zp, weight_scales, output_scales, output_zps):
     """
     Requantizes an int32 accumulator to int8 with per-channel scales, applying ReLU after scaling.
 
@@ -104,39 +151,39 @@ def requantize_int32_with_relu(accumulator_int32, input_scale, input_zero_point,
     clips to int8 range.
 
     Parameters:
-    - accumulator_int32 (np.ndarray): Int32 accumulator with shape (B, W, C_out).
+    - x_int32 (np.ndarray): Int32 accumulator with shape (B, W, C_out).
     - input_scale (np.ndarray): Input scale(s), typically scalar as array.
-    - input_zero_point (np.ndarray): Input zero point(s), typically scalar as array.
+    - input_zp (np.ndarray): Input zero point(s), typically scalar as array.
     - weight_scales (np.ndarray): Weight scales, can be scalar or per-channel.
     - output_scales (np.ndarray): Output scales, can be scalar or per-channel.
-    - output_zero_points (np.ndarray): Output zero points, can be scalar or per-channel.
+    - output_zps (np.ndarray): Output zero points, can be scalar or per-channel.
 
     Returns:
     - np.ndarray: Requantized int8 output with ReLU applied, shape (B, W, C_out).
     """
-    batch_size, width, channels_out = accumulator_int32.shape
-    output_array = np.zeros((batch_size, width, channels_out), dtype=np.int8)
+    B, W, C_out = x_int32.shape
+    output = np.zeros((B, W, C_out), dtype=np.int8)
 
     # Expand scalar scale/zp to per-channel if needed
     if len(weight_scales) == 1:
-        weight_scales = np.full(channels_out, weight_scales[0])
+        weight_scales = np.full(C_out, weight_scales[0])
     if len(output_scales) == 1:
-        output_scales = np.full(channels_out, output_scales[0])
-    if len(output_zero_points) == 1:
-        output_zero_points = np.full(channels_out, output_zero_points[0])
+        output_scales = np.full(C_out, output_scales[0])
+    if len(output_zps) == 1:
+        output_zps = np.full(C_out, output_zps[0])
 
-    for o in range(channels_out):
+    for o in range(C_out):
         scale = input_scale[0] * weight_scales[o] / output_scales[o]
-        zp = output_zero_points[o]
+        zp = output_zps[o]
 
-        scaled_values = (accumulator_int32[..., o] - input_zero_point[0]) * scale
-        rounded_values = np.round(scaled_values) + zp
-        relu_values = np.maximum(rounded_values, zp)
-        output_array[..., o] = np.clip(relu_values, -128, 127).astype(np.int8)
+        x_scaled = (x_int32[..., o] - input_zp[0]) * scale
+        x_rounded = np.round(x_scaled) + zp
+        x_relu = np.maximum(x_rounded, zp)
+        output[..., o] = np.clip(x_relu, -128, 127).astype(np.int8)
 
-    return output_array
-
-def perform_max_pooling1d(input_array, pool_size=2, stride=2, padding='valid'):
+    return output
+    
+def max_pooling1d(x, pool_size=2, stride=2, padding='valid'):
     """
     Performs 1D max pooling on the input array.
 
@@ -145,7 +192,7 @@ def perform_max_pooling1d(input_array, pool_size=2, stride=2, padding='valid'):
     affecting max values. The pooling is done per-batch and per-channel in nested loops.
 
     Parameters:
-    - input_array (np.ndarray): Input array with shape (batch_size, width, channels).
+    - x (np.ndarray): Input array with shape (batch_size, width, channels).
     - pool_size (int): Size of the pooling window (default 2).
     - stride (int): Stride for the pooling window (default 2).
     - padding (str): Padding mode, 'valid' or 'same' (default 'valid').
@@ -153,7 +200,7 @@ def perform_max_pooling1d(input_array, pool_size=2, stride=2, padding='valid'):
     Returns:
     - np.ndarray: Pooled output with shape (batch_size, out_width, channels).
     """
-    batch_size, width, channels = input_array.shape
+    batch_size, width, channels = x.shape
 
     if padding == 'same':
         out_width = int(np.ceil(width / stride))
@@ -161,85 +208,77 @@ def perform_max_pooling1d(input_array, pool_size=2, stride=2, padding='valid'):
         pad_left = pad_needed // 2
         pad_right = pad_needed - pad_left
 
-        pad_val = np.iinfo(input_array.dtype).min if np.issubdtype(input_array.dtype, np.integer) else -np.inf
-        input_array = np.pad(input_array, ((0, 0), (pad_left, pad_right), (0, 0)), mode='constant', constant_values=pad_val)
+        pad_val = np.iinfo(x.dtype).min if np.issubdtype(x.dtype, np.integer) else -np.inf
+        x = np.pad(x, ((0, 0), (pad_left, pad_right), (0, 0)), mode='constant', constant_values=pad_val)
     else:
         out_width = (width - pool_size) // stride + 1
 
-    output_array = np.zeros((batch_size, out_width, channels), dtype=input_array.dtype)
+    out = np.zeros((batch_size, out_width, channels), dtype=x.dtype)
     for b in range(batch_size):
         for c in range(channels):
             for w in range(out_width):
                 start = w * stride
                 end = start + pool_size
-                output_array[b, w, c] = np.max(input_array[b, start:end, c])
+                out[b, w, c] = np.max(x[b, start:end, c])
 
-    return output_array
+    return out
 
-def perform_quantized_add(input_a_int8, scale_a, zp_a,
-                              input_b_int8, scale_b, zp_b,
-                              output_scale, output_zp):
-    # Convert inputs to int32
-    a_int32 = input_a_int8.astype(np.int32) - zp_a
-    b_int32 = input_b_int8.astype(np.int32) - zp_b
+def quantized_add(x1_int8, s1, z1, x2_int8, s2, z2, s_out, z_out):
+    # Step 1: Dequantize both to float32
+    x1_float = s1 * (x1_int8.astype(np.float32) - z1)
+    x2_float = s2 * (x2_int8.astype(np.float32) - z2)
 
-    # Compute effective scales (multiplier) for each input
-    scale_a_eff = scale_a / output_scale
-    scale_b_eff = scale_b / output_scale
+    # Step 2: Add in float
+    added_float = x1_float + x2_float
 
-    # Multiply with effective scale and add (still float at this point)
-    result = a_int32 * scale_a_eff + b_int32 * scale_b_eff
+    # Step 3: Requantize to int8 with output scale and zero point
+    added_quant = np.round(added_float / s_out + z_out)
+    return np.clip(added_quant, -128, 127).astype(np.int8)
 
-    # Round and add output zp
-    result = np.round(result + output_zp).astype(np.int32)
-
-    # Clip to int8 range
-    return np.clip(result, -128, 127).astype(np.int8)
-
-def perform_quantized_global_avg_pool1d(input_int8, input_scale, input_zero_point, output_scale, output_zero_point):
+def quantized_global_avg_pool1d(x_int8, input_scale, input_zp, output_scale, output_zp):
     # Step 1: dequantize
-    dequant_input = input_scale * (input_int8.astype(np.float32) - input_zero_point)
+    x_float = input_scale * (x_int8.astype(np.float32) - input_zp)
     
     # Step 2: global average pool across width (axis=1)
-    pooled_float = np.mean(dequant_input, axis=1, keepdims=True)
+    pooled_float = np.mean(x_float, axis=1, keepdims=True)
     
     # Step 3: quantize result
-    quantized_output = np.clip(
-        np.round(pooled_float / output_scale + output_zero_point),
+    x_q = np.clip(
+        np.round(pooled_float / output_scale + output_zp),
         -128, 127
     ).astype(np.int8)
     
-    return quantized_output
+    return x_q
 
-def perform_quantized_dense(input_int8, weights_int8, biases_int32,
-                            input_scale, input_zero_point,
-                            weight_scales, weight_zero_points,
-                            output_scale, output_zero_point):
+def quantized_dense(x_int8, weight_int8, bias_int32,
+                    input_scale, input_zp,
+                    weight_scales, weight_zps,
+                    output_scale, output_zp):
     """
-    input_int8:      (1, input_dim)
-    weights_int8: (input_dim, output_dim)
-    biases_int32:  (output_dim,)
+    x_int8:      (1, input_dim)
+    weight_int8: (input_dim, output_dim)
+    bias_int32:  (output_dim,)
     """
-    input_dim, output_dim = weights_int8.shape
-    input_int32 = (input_int8.astype(np.int32) - input_zero_point).reshape(1, input_dim)
+    input_dim, output_dim = weight_int8.shape
+    x_int32 = (x_int8.astype(np.int32) - input_zp).reshape(1, input_dim)
 
-    accumulator_int32 = np.zeros((1, output_dim), dtype=np.int32)
+    out_int32 = np.zeros((1, output_dim), dtype=np.int32)
 
     for j in range(output_dim):
-        weights_col = weights_int8[:, j].astype(np.int32) - weight_zero_points[0]
-        acc = np.sum(input_int32 * weights_col) + biases_int32[j]
-        accumulator_int32[0, j] = acc
+        w = weight_int8[:, j].astype(np.int32) - weight_zps[0]
+        acc = np.sum(x_int32 * w) + bias_int32[j]
+        out_int32[0, j] = acc
 
     # Requantize
-    output_int8 = np.zeros_like(accumulator_int32, dtype=np.int8)
+    out_int8 = np.zeros_like(out_int32, dtype=np.int8)
     for j in range(output_dim):
-        combined_scale = (input_scale * weight_scales[0]) / output_scale
-        val = np.round(accumulator_int32[0, j] * combined_scale) + output_zero_point
-        output_int8[0, j] = np.clip(val, -128, 127)
+        scale = (input_scale * weight_scales[0]) / output_scale
+        val = np.round(out_int32[0, j] * scale) + output_zp
+        out_int8[0, j] = np.clip(val, -128, 127)
 
-    return output_int8
-
-def extract_and_reshape_conv_weights(layer_data, weight_key):
+    return out_int8
+    
+def process_weights(data, name):
     """
     Processes and reshapes weights from a dictionary (e.g., from JSON).
 
@@ -247,60 +286,61 @@ def extract_and_reshape_conv_weights(layer_data, weight_key):
     and transposes to the expected shape (C_in, C_out, K) for convolution.
 
     Parameters:
-    - layer_data (dict): Dictionary containing model weights.
-    - weight_key (str): Key for the weights in the data dict.
+    - data (dict): Dictionary containing model weights.
+    - name (str): Key for the weights in the data dict.
 
     Returns:
     - np.ndarray: Reshaped weights array.
     """
-    return np.squeeze(np.array(layer_data[weight_key]["weights"]), axis=1).transpose(1, 2, 0)
+    return np.squeeze(np.array(data[name]["weights"]), axis=1).transpose(1, 2, 0)
 
-def extract_biases(layer_data, bias_key):
+def process_biases(data, name):
     """
     Extracts biases from a dictionary (e.g., from JSON).
 
     This helper function simply converts the biases list to a numpy array.
 
     Parameters:
-    - layer_data (dict): Dictionary containing model biases.
-    - bias_key (str): Key for the biases in the data dict.
+    - data (dict): Dictionary containing model biases.
+    - name (str): Key for the biases in the data dict.
 
     Returns:
     - np.ndarray: Biases array.
     """
-    return np.array(layer_data[bias_key]["weights"])
+    return np.array(data[name]["weights"])
 
-def extract_and_reshape_dense_weights(layer_data, weight_key):
+def process_dense_weights(data, name):
     """
-    Processes and reshapes weights from a dictionary (e.g., from JSON) for dense layers.
+    Processes and reshapes weights from a dictionary (e.g., from JSON).
 
-    This helper function extracts weights by name and transposes to the expected shape (input_dim, output_dim).
+    This helper function extracts weights by name, squeezes an axis (likely batch or height for 1D conv),
+    and transposes to the expected shape (C_in, C_out, K) for convolution.
 
     Parameters:
-    - layer_data (dict): Dictionary containing model weights.
-    - weight_key (str): Key for the weights in the data dict.
+    - data (dict): Dictionary containing model weights.
+    - name (str): Key for the weights in the data dict.
 
     Returns:
     - np.ndarray: Reshaped weights array.
     """
-    return np.array(layer_data[weight_key]["weights"]).transpose(1, 0)
+    return np.array(data[name]["weights"]).transpose(1, 0)
 
-def extract_dense_biases(layer_data, bias_key):
+def process_dense_biases(data, name):
     """
-    Extracts biases from a dictionary (e.g., from JSON) for dense layers.
+    Extracts biases from a dictionary (e.g., from JSON).
 
     This helper function simply converts the biases list to a numpy array.
 
     Parameters:
-    - layer_data (dict): Dictionary containing model biases.
-    - bias_key (str): Key for the biases in the data dict.
+    - data (dict): Dictionary containing model biases.
+    - name (str): Key for the biases in the data dict.
 
     Returns:
     - np.ndarray: Biases array.
     """
-    return np.array(layer_data[bias_key]["weights"])
+    return np.array(data[name]["weights"])
 
-def parse_string_to_float_array(string_repr):
+def str_to_float_list(str):
     """
     Converts a string representation of a list to a numpy array of floats.
 
@@ -308,181 +348,240 @@ def parse_string_to_float_array(string_repr):
     then converts it to a numpy array.
 
     Parameters:
-    - string_repr (str): String like '[0.1, 0.2]' to parse.
+    - str (str): String like '[0.1, 0.2]' to parse.
 
     Returns:
     - np.ndarray: Array of floats.
     """
-    return np.array(ast.literal_eval(string_repr))
+    return np.array(ast.literal_eval(str))
 
-def extract_scale_and_zero_point(layer_data, key):
+def get_scale_and_zero_points(data, name):
     """
     Retrieves scale and zero point arrays from a dictionary by name.
 
     This helper function extracts 'scale' and 'zp' strings from the data,
-    parses them using parse_string_to_float_array, and returns them as numpy arrays.
+    parses them using str_to_float_list, and returns them as numpy arrays.
 
     Parameters:
-    - layer_data (dict): Dictionary containing scales and zero points.
-    - key (str): Key for the entry in the data dict.
+    - data (dict): Dictionary containing scales and zero points.
+    - name (str): Key for the entry in the data dict.
 
     Returns:
     - tuple: (scales np.ndarray, zero_points np.ndarray)
     """
-    return parse_string_to_float_array(layer_data[key]["scale"]), parse_string_to_float_array(layer_data[key]["zp"])
+    return np.array(str_to_float_list(data[name]["scale"])), np.array(str_to_float_list(data[name]["zp"]))
 
-def process_quantized_inception_block(input_int8, input_scale, input_zero_point, pretrained_weights, block_id, layer_names_dict):
-    # Access weights and parameters for the current block
-    block_weights = pretrained_weights[block_id]
+def quantized_inception_block(x_int8, input_scale, input_zp, weights_for_this_block, dict_layer_names):
+    ### First Block (quantized conv2d)
+    #############################################################################################################################################################################################
+    # Process weights and biases for the first convolution (conv11).
+    # Insight: The process_weights function reshapes weights to (C_in, C_out, K), 
+    # which is critical for 1D convolution compatibility. The long key names suggest 
+    # the JSON is exported from a framework like TensorFlow with quantization-aware training.
 
-    # Initial convolution (conv11)
-    conv11_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv11"]["weight"])
-    conv11_biases = extract_biases(block_weights, layer_names_dict["conv11"]["bias"])
-    conv11_weight_scales, conv11_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv11"]["weight"])
-    conv11_output_scales, conv11_output_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["relu1"])
+    conv11_weights = process_weights(weights_for_this_block, dict_layer_names["conv11"]["weight"])
+    conv11_biases = process_biases(weights_for_this_block, dict_layer_names["conv11"]["bias"])
 
-    conv11_accumulator = perform_quantized_conv1d(input_int8, conv11_weights, conv11_biases,
-                                                  input_scale, input_zero_point,
-                                                  conv11_weight_scales, conv11_weight_zps)
+    # Retrieve quantization parameters for weights and outputs.
+    # Insight: Per-channel quantization for weights (conv11_weight_scales, conv11_weight_zps) 
+    # allows each output channel to have its own scale and zero point, potentially reducing 
+    # quantization error compared to a single scale for all channels.
+    conv11_weight_scales, conv11_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv11"]["weight"])
+    conv11_output_scales, conv11_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["relu1"])
+
+    # Perform first convolution, ReLU, and max pooling.
+    # Insight: The quantized_conv1d function accumulates in int32 to avoid overflow, 
+    # a common practice in quantized neural networks since int8 multiplication results 
+    # can exceed the int8 range.
+    out_conv11 = quantized_conv1d(x_int8, conv11_weights, conv11_biases,
+                                  input_scale, input_zp,
+                                  conv11_weight_scales, conv11_weight_zps, stride=2)
     
-    conv11_output = requantize_int32_with_relu(conv11_accumulator, 
-                                               input_scale,
-                                               input_zero_point,
-                                               conv11_weight_scales,
-                                               conv11_output_scales, conv11_output_zps)
+    # Requantize with ReLU to prepare for the next layer.
+    # Insight: requantize_with_relu applies ReLU after scaling, ensuring non-negative 
+    # outputs where required, and clips to int8, maintaining compatibility with 
+    # subsequent layers that expect int8 inputs.
+    out_conv11 = requantize_with_relu(out_conv11, 
+                                      input_scale,
+                                      input_zp,
+                                      conv11_weight_scales,
+                                      conv11_output_scales, conv11_output_zps)
 
-    conv11_pooled = perform_max_pooling1d(conv11_output, pool_size=2, stride=2)
+    # Apply max pooling to reduce spatial dimensions.
+    # Insight: Max pooling with pool_size=2 and stride=2 halves the width, reducing 
+    # computational load for subsequent layers while preserving important features.
+    # out_conv11 = max_pooling1d(out_conv11, pool_size=2, stride=2)
     
-    # Inception sub-block 1 (conv12 and branches)
-    conv12_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv12"]["weight"])
-    conv12_biases = extract_biases(block_weights, layer_names_dict["conv12"]["bias"])
-    conv12_input_scales, conv12_input_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["maxpool1"])
-    conv12_weight_scales, conv12_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12"]["weight"])
-
-    conv12_accumulator = perform_quantized_conv1d(conv11_pooled, conv12_weights, conv12_biases,
-                                                  conv12_input_scales, conv12_input_zps,
-                                                  conv12_weight_scales, conv12_weight_zps)
+    ## Inception Block 1
+    # Insight: The inception block uses multiple parallel branches to capture features 
+    # at different scales, a design inspired by Inception architectures (e.g., GoogLeNet), 
+    # which improves model expressiveness without significantly increasing computation.
     
-    conv12_out_scales, conv12_out_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12"]["output_scale"])
-    conv12_requantized = requantize_int32_to_int8(conv12_accumulator, conv12_input_scales, conv12_weight_scales, conv12_out_scales, conv12_out_zps)
+    # Process weights and biases for the first convolution in the inception block.
+    conv12_weights = process_weights(weights_for_this_block, dict_layer_names["conv12"]["weight"])
+    conv12_biases = process_biases(weights_for_this_block, dict_layer_names["conv12"]["bias"])
     
-    # Branch 1.1
-    conv12_1_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv12_1"]["weight"])
-    conv12_1_biases = extract_biases(block_weights, layer_names_dict["conv12_1"]["bias"])
-    conv12_1_weight_scales, conv12_1_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12_1"]["weight"])
-    conv12_1_output_scales, conv12_1_output_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12_1"]["output_scale"])
+    # Retrieve quantization parameters for the convolution input and weights.
+    # Insight: The input scales/zps come from the previous max pooling layer, 
+    # ensuring the quantization parameters are correctly propagated through the network.
+    conv12_input_scales, conv12_input_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["relu1"])
+    conv12_weight_scales, conv12_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12"]["weight"])
 
-    conv12_1_accumulator = perform_quantized_conv1d(conv12_requantized, conv12_1_weights, conv12_1_biases,
-                                                    conv12_out_scales, conv12_out_zps, conv12_1_weight_scales, conv12_1_weight_zps)
-    branch1_1_output = requantize_int32_to_int8(conv12_1_accumulator, conv12_out_scales, conv12_1_weight_scales, conv12_1_output_scales, conv12_1_output_zps)
-
-    # Branch 1.2
-    conv12_2_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv12_2"]["weight"])
-    conv12_2_biases = extract_biases(block_weights, layer_names_dict["conv12_2"]["bias"])
-    conv12_2_weight_scales, conv12_2_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12_2"]["weight"])
-    conv12_2_output_scales, conv12_2_output_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12_2"]["output_scale"])
-
-    conv12_2_accumulator = perform_quantized_conv1d(conv12_requantized, conv12_2_weights, conv12_2_biases,
-                                                    conv12_out_scales, conv12_out_zps, conv12_2_weight_scales, conv12_2_weight_zps)
-    branch1_2_output = requantize_int32_to_int8(conv12_2_accumulator, conv12_out_scales, conv12_2_weight_scales, conv12_2_output_scales, conv12_2_output_zps)
-
-    # Branch 1.3
-    conv12_3_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv12_3"]["weight"])
-    conv12_3_biases = extract_biases(block_weights, layer_names_dict["conv12_3"]["bias"])
-    conv12_3_weight_scales, conv12_3_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12_3"]["weight"])
-    conv12_3_output_scales, conv12_3_output_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12_3"]["output_scale"])
-
-    conv12_3_accumulator = perform_quantized_conv1d(conv12_requantized, conv12_3_weights, conv12_3_biases,
-                                                    conv12_out_scales, conv12_out_zps, conv12_3_weight_scales, conv12_3_weight_zps)
-    branch1_3_output = requantize_int32_to_int8(conv12_3_accumulator, conv12_out_scales, conv12_3_weight_scales, conv12_3_output_scales, conv12_3_output_zps)
-
-    # Branch 1.4 (with max pooling)
-    branch1_4_pooled = perform_max_pooling1d(conv11_pooled, pool_size=3, stride=1, padding="same")
-
-    conv12_4_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv12_4"]["weight"])
-    conv12_4_biases = extract_biases(block_weights, layer_names_dict["conv12_4"]["bias"])
-    conv12_4_weight_scales, conv12_4_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12_4"]["weight"])
-    conv12_4_input_scales, conv12_4_input_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["maxpool2"])
-    concat1_scales, concat1_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv12_4"]["output_scale"])
-
-    conv12_4_accumulator = perform_quantized_conv1d(branch1_4_pooled, conv12_4_weights, conv12_4_biases,
-                                                    conv12_4_input_scales, conv12_4_input_zps, conv12_4_weight_scales, conv12_4_weight_zps)
-    branch1_4_output = requantize_int32_to_int8(conv12_4_accumulator, conv12_4_input_scales, conv12_4_weight_scales, concat1_scales, concat1_zps)
-
-    # Concatenate branches for sub-block 1
-    concat1_output = np.concatenate([branch1_4_output, branch1_1_output, branch1_2_output, branch1_3_output], axis=-1)
-
-    relu1_scales, relu1_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["relu2"])
-    concat1_with_relu = requantize_int32_with_relu(concat1_output, concat1_scales, concat1_zps, [1.0], relu1_scales, relu1_zps)
+    # Apply convolution for the inception block's initial layer.
+    out_conv12 = quantized_conv1d(out_conv11, conv12_weights, conv12_biases,
+                                  conv12_input_scales, conv12_input_zps,
+                                  conv12_weight_scales, conv12_weight_zps)
     
-    # Inception sub-block 2 (conv13 and branches)
-    conv13_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv13"]["weight"])
-    conv13_biases = extract_biases(block_weights, layer_names_dict["conv13"]["bias"])
-    conv13_input_scales, conv13_input_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["relu2"])
-    conv13_weight_scales, conv13_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13"]["weight"])
+    # Retrieve output quantization parameters and requantize.
+    # Insight: Requantization here adjusts the output to match the scale expected by 
+    # the subsequent branches, ensuring numerical consistency across the inception block.
+    conv12_out_scales, conv12_out_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12"]["output_scale"])
+    requantize_conv12 = requantize(out_conv12, conv12_input_scales, conv12_weight_scales, conv12_out_scales, conv12_out_zps)
     
-    conv13_accumulator = perform_quantized_conv1d(concat1_with_relu, conv13_weights, conv13_biases,
-                                                  conv13_input_scales, conv13_input_zps,
-                                                  conv13_weight_scales, conv13_weight_zps)
+    # Requantize for three branches (1.1, 1.2, 1.3) and process branch 1.4 separately.
+    # Insight: Each branch applies a different convolution to capture varied features, 
+    # and requantization ensures outputs are aligned for concatenation later.
+
+    # BRANCH 1.1
+    # Process weights, biases, and quantization parameters for the first branch.
+    conv12_1_weights = process_weights(weights_for_this_block, dict_layer_names["conv12_1"]["weight"])
+    conv12_1_biases = process_biases(weights_for_this_block, dict_layer_names["conv12_1"]["bias"])
+    conv12_1_weight_scales, conv12_1_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12_1"]["weight"])
+    conv12_1_output_scales, conv12_1_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12_1"]["output_scale"])
+
+    # Apply convolution and requantize for branch 1.1.
+    # Insight: Each branch processes the same input (requantize_conv12), allowing 
+    # parallel feature extraction with different filter sizes or configurations.
+    out_conv12_1 = quantized_conv1d(requantize_conv12, conv12_1_weights, conv12_1_biases,
+                                    conv12_out_scales, conv12_out_zps, conv12_1_weight_scales, conv12_1_weight_zps)
+    out_conv12_1 = requantize(out_conv12_1, conv12_out_scales, conv12_1_weight_scales, conv12_1_output_scales, conv12_1_output_zps)
+
+    # BRANCH 1.2
+    # Process weights, biases, and quantization parameters for the second branch.
+    conv12_2_weights = process_weights(weights_for_this_block, dict_layer_names["conv12_2"]["weight"])
+    conv12_2_biases = process_biases(weights_for_this_block, dict_layer_names["conv12_2"]["bias"])
+    conv12_2_weight_scales, conv12_2_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12_2"]["weight"])
+    conv12_2_output_scales, conv12_2_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12_2"]["output_scale"])
+
+    # Apply convolution and requantize for branch 1.2.
+    out_conv12_2 = quantized_conv1d(requantize_conv12, conv12_2_weights, conv12_2_biases,
+                                    conv12_out_scales, conv12_out_zps, conv12_2_weight_scales, conv12_2_weight_zps)
+    out_conv12_2 = requantize(out_conv12_2, conv12_out_scales, conv12_2_weight_scales, conv12_2_output_scales, conv12_2_output_zps)
+
+    # BRANCH 1.3
+    # Process weights, biases, and quantization parameters for the third branch.
+    conv12_3_weights = process_weights(weights_for_this_block, dict_layer_names["conv12_3"]["weight"])
+    conv12_3_biases = process_biases(weights_for_this_block, dict_layer_names["conv12_3"]["bias"])
+    conv12_3_weight_scales, conv12_3_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12_3"]["weight"])
+    conv12_3_output_scales, conv12_3_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12_3"]["output_scale"])
+
+    # Apply convolution and requantize for branch 1.3.
+    out_conv12_3 = quantized_conv1d(requantize_conv12, conv12_3_weights, conv12_3_biases,
+                                    conv12_out_scales, conv12_out_zps, conv12_3_weight_scales, conv12_3_weight_zps)
+    out_conv12_3 = requantize(out_conv12_3, conv12_out_scales, conv12_3_weight_scales, conv12_3_output_scales, conv12_3_output_zps)
+
+    # BRANCH 1.4
+    # Apply max pooling followed by convolution for the fourth branch.
+    # Insight: This branch uses max pooling before convolution, likely to reduce 
+    # spatial dimensions and computational cost, a common strategy in inception modules.
+    out_conv12_4 = max_pooling1d(out_conv11, pool_size=3, stride=1, padding="same")
+
+    # Process weights, biases, and quantization parameters for the fourth branch.
+    conv12_4_weights = process_weights(weights_for_this_block, dict_layer_names["conv12_4"]["weight"])
+    conv12_4_biases = process_biases(weights_for_this_block, dict_layer_names["conv12_4"]["bias"])
+    conv12_4_scales, conv12_4_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv12_4"]["weight"])
+    conv12_4_input_scales, conv12_4_input_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["maxpool2"])
+    concat_1_output_scales, concat_1_output_zps = get_scale_and_zero_points(weights_for_this_block,  dict_layer_names["conv12_4"]["output_scale"])
+
+    # Apply convolution and requantize for branch 1.4.
+    out_conv12_4 = quantized_conv1d(out_conv12_4, conv12_4_weights, conv12_4_biases,
+                                    conv12_4_input_scales, conv12_4_input_zps, conv12_4_scales, conv12_4_zps)
+    out_conv12_4 = requantize(out_conv12_4, conv12_4_input_scales, conv12_4_scales, concat_1_output_scales, concat_1_output_zps)
+
+    # Concatenate outputs from all four branches along the channel axis.
+    # Insight: Concatenation combines features from different branches, increasing 
+    # the channel dimension and enabling the model to leverage diverse feature representations.
+    out_conv12_1234 = np.concatenate([out_conv12_4, out_conv12_1, out_conv12_2, out_conv12_3], axis=-1)
+
+    # Retrieve quantization parameters for the final ReLU and apply requantization.
+    # Insight: The final ReLU with a dummy weight scale of [1.0] suggests a pass-through 
+    # scale for the concatenated output, ensuring the ReLU operates correctly in the 
+    # quantized domain before downstream layers.
+    relu1_scales, relu1_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["relu2"])
+
+    out_conv12_1234 = requantize_with_relu(out_conv12_1234, concat_1_output_scales, concat_1_output_zps, [1.0], relu1_scales, relu1_zps)
+
+    conv13_weights = process_weights(weights_for_this_block, dict_layer_names["conv13"]["weight"])
+    conv13_biases = process_biases(weights_for_this_block, dict_layer_names["conv13"]["bias"])
+    conv13_input_scales, conv13_input_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["relu2"])
+    conv13_weight_scales, conv13_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13"]["weight"])
     
-    conv13_out_scales, conv13_out_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13"]["output_scale"])
-    conv13_requantized = requantize_int32_to_int8(conv13_accumulator, conv13_input_scales, conv13_weight_scales, conv13_out_scales, conv13_out_zps)
-
-    # Branch 2.1
-    conv13_1_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv13_1"]["weight"])
-    conv13_1_biases = extract_biases(block_weights, layer_names_dict["conv13_1"]["bias"])
-    conv13_1_weight_scales, conv13_1_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13_1"]["weight"])
-    conv13_1_output_scales, conv13_1_output_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13_1"]["output_scale"])
-
-    conv13_1_accumulator = perform_quantized_conv1d(conv13_requantized, conv13_1_weights, conv13_1_biases,
-                                                    conv13_out_scales, conv13_out_zps, conv13_1_weight_scales, conv13_1_weight_zps)
-    branch2_1_output = requantize_int32_to_int8(conv13_1_accumulator, conv13_out_scales, conv13_1_weight_scales, conv13_1_output_scales, conv13_1_output_zps)
-
-    # Branch 2.2
-    conv13_2_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv13_2"]["weight"])
-    conv13_2_biases = extract_biases(block_weights, layer_names_dict["conv13_2"]["bias"])
-    conv13_2_weight_scales, conv13_2_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13_2"]["weight"])
-    conv13_2_output_scales, conv13_2_output_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13_2"]["output_scale"])
-
-    conv13_2_accumulator = perform_quantized_conv1d(conv13_requantized, conv13_2_weights, conv13_2_biases,
-                                                    conv13_out_scales, conv13_out_zps, conv13_2_weight_scales, conv13_2_weight_zps)
-    branch2_2_output = requantize_int32_to_int8(conv13_2_accumulator, conv13_out_scales, conv13_2_weight_scales, conv13_2_output_scales, conv13_2_output_zps)
-
-    # Branch 2.3
-    conv13_3_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv13_3"]["weight"])
-    conv13_3_biases = extract_biases(block_weights, layer_names_dict["conv13_3"]["bias"])
-    conv13_3_weight_scales, conv13_3_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13_3"]["weight"])
-    conv13_3_output_scales, conv13_3_output_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13_3"]["output_scale"])
-
-    conv13_3_accumulator = perform_quantized_conv1d(conv13_requantized, conv13_3_weights, conv13_3_biases,
-                                                    conv13_out_scales, conv13_out_zps, conv13_3_weight_scales, conv13_3_weight_zps)
-    branch2_3_output = requantize_int32_to_int8(conv13_3_accumulator, conv13_out_scales, conv13_3_weight_scales, conv13_3_output_scales, conv13_3_output_zps)
+    out_conv13 = quantized_conv1d(out_conv12_1234, conv13_weights, conv13_biases,
+                                  conv13_input_scales, conv13_input_zps,
+                                  conv13_weight_scales, conv13_weight_zps)
     
-    # Branch 2.4 (with max pooling)
-    branch2_4_pooled = perform_max_pooling1d(concat1_with_relu, pool_size=3, stride=1, padding="same")
+    conv13_out_scales, conv13_out_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13"]["output_scale"])
+    requantize_conv13 = requantize(out_conv13, conv13_input_scales, conv13_weight_scales, conv13_out_scales, conv13_out_zps)
 
-    conv13_4_weights = extract_and_reshape_conv_weights(block_weights, layer_names_dict["conv13_4"]["weight"])
-    conv13_4_biases = extract_biases(block_weights, layer_names_dict["conv13_4"]["bias"])
-    conv13_4_weight_scales, conv13_4_weight_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13_4"]["weight"])
-    conv13_4_input_scales, conv13_4_input_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["maxpool3"])
-    concat2_scales, concat2_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["conv13_4"]["output_scale"])
+    # BRANCH 2.1
+    # Process weights, biases, and quantization parameters for the first branch.
+    conv13_1_weights = process_weights(weights_for_this_block, dict_layer_names["conv13_1"]["weight"])
+    conv13_1_biases = process_biases(weights_for_this_block, dict_layer_names["conv13_1"]["bias"])
+    conv13_1_weight_scales, conv13_1_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13_1"]["weight"])
+    conv13_1_output_scales, conv13_1_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13_1"]["output_scale"])
 
-    conv13_4_accumulator = perform_quantized_conv1d(branch2_4_pooled, conv13_4_weights, conv13_4_biases,
-                                                    conv13_4_input_scales, conv13_4_input_zps, conv13_4_weight_scales, conv13_4_weight_zps)
-    branch2_4_output = requantize_int32_to_int8(conv13_4_accumulator, conv13_4_input_scales, conv13_4_weight_scales, concat2_scales, concat2_zps)
+    out_conv13_1 = quantized_conv1d(requantize_conv13, conv13_1_weights, conv13_1_biases,
+                                    conv13_out_scales, conv13_out_zps, conv13_1_weight_scales, conv13_1_weight_zps)
+    out_conv13_1 = requantize(out_conv13_1, conv13_out_scales, conv13_1_weight_scales, conv13_1_output_scales, conv13_1_output_zps)
 
-    # Concatenate branches for sub-block 2
-    concat2_output = np.concatenate([branch2_4_output, branch2_1_output, branch2_2_output, branch2_3_output], axis=-1)
+    # BRANCH 2.2
+    # Process weights, biases, and quantization parameters for the second branch.
+    conv13_2_weights = process_weights(weights_for_this_block, dict_layer_names["conv13_2"]["weight"])
+    conv13_2_biases = process_biases(weights_for_this_block, dict_layer_names["conv13_2"]["bias"])
+    conv13_2_weight_scales, conv13_2_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13_2"]["weight"])
+    conv13_2_output_scales, conv13_2_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13_2"]["output_scale"])
 
-    relu2_scales, relu2_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["relu3"])
-    concat2_with_relu = requantize_int32_with_relu(concat2_output, concat2_scales, concat2_zps, [1.0], relu2_scales, relu2_zps)
+    out_conv13_2 = quantized_conv1d(requantize_conv13, conv13_2_weights, conv13_2_biases,
+                                    conv13_out_scales, conv13_out_zps, conv13_2_weight_scales, conv13_2_weight_zps)
+    out_conv13_2 = requantize(out_conv13_2, conv13_out_scales, conv13_2_weight_scales, conv13_2_output_scales, conv13_2_output_zps)
+
+    # BRANCH 2.3
+    # Process weights, biases, and quantization parameters for the third branch.
+    conv13_3_weights = process_weights(weights_for_this_block, dict_layer_names["conv13_3"]["weight"])
+    conv13_3_biases = process_biases(weights_for_this_block, dict_layer_names["conv13_3"]["bias"])
+    conv13_3_weight_scales, conv13_3_weight_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13_3"]["weight"])
+    conv13_3_output_scales, conv13_3_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13_3"]["output_scale"])
+
+    out_conv13_3 = quantized_conv1d(requantize_conv13, conv13_3_weights, conv13_3_biases,
+                                    conv13_out_scales, conv13_out_zps, conv13_3_weight_scales, conv13_3_weight_zps)
+    out_conv13_3 = requantize(out_conv13_3, conv13_out_scales, conv13_3_weight_scales, conv13_3_output_scales, conv13_3_output_zps)
     
-    # Skip connection (add)
-    add_output_scales, add_output_zps = extract_scale_and_zero_point(block_weights, layer_names_dict["add1"])    
-    block_output = perform_quantized_add(conv11_pooled, conv12_input_scales, conv12_input_zps, concat2_with_relu, relu2_scales, relu2_zps, add_output_scales, add_output_zps)
-    return block_output, add_output_scales, add_output_zps
+    # BRANCH 2.4
+    out_conv13_4 = max_pooling1d(out_conv12_1234, pool_size=3, stride=1, padding="same")
 
-def run_quantized_model_on_input(input_int8, pretrained_weights, input_scale, input_zero_point):
+    # Process weights, biases, and quantization parameters for the fourth branch.
+    conv13_4_weights = process_weights(weights_for_this_block, dict_layer_names["conv13_4"]["weight"])
+    conv13_4_biases = process_biases(weights_for_this_block, dict_layer_names["conv13_4"]["bias"])
+    conv13_4_scales, conv13_4_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13_4"]["weight"])
+    conv13_4_input_scales, conv13_4_input_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["maxpool3"])
+    concat_2_output_scales, concat_2_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["conv13_4"]["output_scale"])
+
+    # Apply convolution and requantize for branch 2.4.
+    out_conv13_4 = quantized_conv1d(out_conv13_4, conv13_4_weights, conv13_4_biases,
+                                    conv13_4_input_scales, conv13_4_input_zps, conv13_4_scales, conv13_4_zps)
+    out_conv13_4 = requantize(out_conv13_4, conv13_4_input_scales, conv13_4_scales, concat_2_output_scales, concat_2_output_zps)
+
+    out_conv13_1234 = np.concatenate([out_conv13_4, out_conv13_1, out_conv13_2, out_conv13_3], axis=-1)
+
+    relu2_scales, relu2_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["relu3"])
+
+    out_conv13_1234 = requantize_with_relu(out_conv13_1234, concat_2_output_scales, concat_2_output_zps, [1.0], relu2_scales, relu2_zps)
+    
+    skip_connection1_output_scales, skip_connection1_output_zps = get_scale_and_zero_points(weights_for_this_block, dict_layer_names["add1"])    
+    skip_connection1 = quantized_add(out_conv11, conv12_input_scales, conv12_input_zps, out_conv13_1234, relu2_scales, relu2_zps, skip_connection1_output_scales, skip_connection1_output_zps)
+    return skip_connection1, skip_connection1_output_scales, skip_connection1_output_zps
+
+def run_quantized_model_on_single_input(x_int8, pretrained_int_weights, input_scale, input_zp):
     """
     Simulates a forward pass through a quantized neural network model.
 
@@ -510,81 +609,82 @@ def run_quantized_model_on_input(input_int8, pretrained_weights, input_scale, in
     No parameters or returns; it executes the model simulation directly and prints the 
     final output for inspection.
     """
-    output_int8_1, output_scale_1, output_zp_1 = process_quantized_inception_block(input_int8, input_scale, input_zero_point, pretrained_weights, "first_block", dict_all_layer_names["first_block"])
-    output_int8_2, output_scale_2, output_zp_2 = process_quantized_inception_block(output_int8_1, output_scale_1, output_zp_1, pretrained_weights, "second_block", dict_all_layer_names["second_block"])
-    output_int8_3, output_scale_3, output_zp_3 = process_quantized_inception_block(output_int8_2, output_scale_2, output_zp_2, pretrained_weights, "third_block", dict_all_layer_names["third_block"])
-
-    # Global average pooling
-    global_pool_scales, global_pool_zps = extract_scale_and_zero_point(pretrained_weights, "model/quant_global_average_pooling2d/Mean")
-    pooled_output = perform_quantized_global_avg_pool1d(output_int8_3, output_scale_3, output_zp_3, global_pool_scales, global_pool_zps)
+    x_int8, output_scale1, output_zero1 = quantized_inception_block(x_int8, input_scale, input_zp, pretrained_int_weights, dict_all_layer_names["first_block"])
+    x_int8, output_scale2, output_zero2 = quantized_inception_block(x_int8, output_scale1, output_zero1, pretrained_int_weights, dict_all_layer_names["second_block"])
+    x_int8, output_scale3, output_zero3 = quantized_inception_block(x_int8, output_scale2, output_zero2, pretrained_int_weights, dict_all_layer_names["third_block"])
+    
+    # Global averaing pooling
+    global_pooling_scales, global_pooling_zps = get_scale_and_zero_points(pretrained_int_weights, "model/quant_global_average_pooling2d/Mean")
+    x_int8 = quantized_global_avg_pool1d(x_int8, output_scale3, output_zero3, global_pooling_scales, global_pooling_zps)
 
     # Dense layer
-    dense_weights = extract_and_reshape_dense_weights(pretrained_weights["dense_layer"], "model/quant_dense/MatMul;model/quant_dense/LastValueQuant/FakeQuantWithMinMaxVars")
-    dense_biases = extract_dense_biases(pretrained_weights["dense_layer"], "model/quant_dense/LastValueQuant_1/FakeQuantWithMinMaxVars")
+    dense_weights = process_dense_weights(pretrained_int_weights, "model/quant_dense/MatMul;model/quant_dense/LastValueQuant/FakeQuantWithMinMaxVars")
+    dense_biases = process_dense_biases(pretrained_int_weights, "model/quant_dense/LastValueQuant_1/FakeQuantWithMinMaxVars")
 
-    dense_input_scales, dense_input_zps = global_pool_scales, global_pool_zps
-    dense_weight_scales, dense_weight_zps = extract_scale_and_zero_point(pretrained_weights["dense_layer"], "model/quant_dense/MatMul;model/quant_dense/LastValueQuant/FakeQuantWithMinMaxVars")
-    dense_output_scales, dense_output_zps = extract_scale_and_zero_point(pretrained_weights, "output")
+    dense_input_scales, dense_input_zps = global_pooling_scales, global_pooling_zps
+    dense_weight_scales, dense_weight_zps = get_scale_and_zero_points(pretrained_int_weights, "model/quant_dense/MatMul;model/quant_dense/LastValueQuant/FakeQuantWithMinMaxVars")
+    dense_output_scales, dense_output_zps = get_scale_and_zero_points(pretrained_int_weights, "output")
 
-    logits = perform_quantized_dense(np.squeeze(pooled_output, axis=1), dense_weights, dense_biases,
-                                     dense_input_scales, dense_input_zps,
-                                     dense_weight_scales, dense_weight_zps,
-                                     dense_output_scales[0], dense_output_zps[0])
+    logits = quantized_dense(np.squeeze(x_int8, axis=1), dense_weights, dense_biases,
+                    dense_input_scales, dense_input_zps,
+                    dense_weight_scales, dense_weight_zps,
+                    dense_output_scales[0], dense_output_zps[0])
 
     return logits
 
 def main():
+    # Load dataset
     # Load pretrained quantized weights and quantization parameters from JSON.
     # Insight: JSON is used for portability and human-readability, but parsing large 
     # JSON files can be a bottleneck in production systems; binary formats like 
     # TensorFlow's TFLite might be preferred for efficiency.
-    pretrained_weights = json.load(open("model_weights_scales.json", "r"))
+    pretrained_int_weights = json.load(open("model_weights_scales.json", "r"))
 
     # Extract input scale and zero point for quantization.
-    # Insight: The use of parse_string_to_float_array suggests quantization parameters are 
+    # Insight: The use of str_to_float_list suggests quantization parameters are 
     # stored as strings in JSON, requiring parsing. This could introduce errors if 
     # the string format is inconsistent.
-    input_scale, input_zp = parse_string_to_float_array(pretrained_weights["input"]["scale"]), parse_string_to_float_array(pretrained_weights["input"]["zp"])    
-    output_scale, output_zp = parse_string_to_float_array(pretrained_weights["output"]["scale"]), parse_string_to_float_array(pretrained_weights["output"]["zp"])
-    
-    all_predictions = []
-    all_ground_truths = []
+    input_scale, input_zp = np.array(str_to_float_list(pretrained_int_weights["input"]["scale"])), np.array(str_to_float_list(pretrained_int_weights["input"]["zp"]))    
+    output_scale, output_zp = np.array(str_to_float_list(pretrained_int_weights["output"]["scale"])), np.array(str_to_float_list(pretrained_int_weights["output"]["zp"]))
 
-    test_inputs, test_labels = np.load("test_data.npy"), np.load("test_gts.npy")
-    progress_bar = tqdm(total=None)  # Unknown length
+    all_preds = []
+    all_labels = []
+
+    test_dataset, test_gts = np.load("test_data.npy"), np.load("test_gts.npy")
+    progress = tqdm(total=None)  # Unknown length
 
     N = 33
-    for i, (input_data, label) in enumerate(zip(test_inputs, test_labels)):
-        quantized_input = quantize_float_to_int8(input_data, input_scale, input_zp)
+    for i, (data, gt) in enumerate(zip(test_dataset, test_gts)):
+        x_int8 = quantize(data, input_scale, input_zp)
 
-        model_output = run_quantized_model_on_input(quantized_input, pretrained_weights, input_scale, input_zp)
+        output = run_quantized_model_on_single_input(x_int8, pretrained_int_weights, input_scale, input_zp)
 
         # Dequantize
-        dequant_output = output_scale * (model_output.astype(np.float32) - output_zp)
+        output = output_scale * (output.astype(np.float32) - output_zp)
 
-        prediction = np.argmax(dequant_output, axis=-1)
-        all_predictions.append(prediction[0])
-        all_ground_truths.append(label)
+        pred = np.argmax(output, axis=-1)
+        all_preds.append(pred[0])
+        all_labels.append(gt)
 
-        progress_bar.update(1)  # Manually advance progress bar
+        progress.update(1)  # Manually advance progress bar
         if i > N:
             break
-            
-    progress_bar.close()
 
-    print(len(all_ground_truths))
-    accuracy = accuracy_score(all_ground_truths, all_predictions)
-    f1 = f1_score(all_ground_truths, all_predictions, average='weighted')
-    precision = precision_score(all_ground_truths, all_predictions, average='weighted')
-    recall = recall_score(all_ground_truths, all_predictions, average='weighted')
-    conf_matrix = confusion_matrix(all_ground_truths, all_predictions)
+    progress.close()
 
-    print("Accuracy:", accuracy)
+    print(len(all_labels))
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    precision = precision_score(all_labels, all_preds, average='weighted')
+    recall = recall_score(all_labels, all_preds, average='weighted')
+    cm = confusion_matrix(all_labels, all_preds)
+
+    print("Accuracy:", acc)
     print("F1:", f1)
     print("Precision:", precision)
     print("Recall:", recall)
 
-    print(all_predictions)
-    print(all_ground_truths)
+    print(all_preds)
+    print(all_labels)
 
 main()
