@@ -6,7 +6,6 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d/BiasAdd/ReadVariableOp"
         },
         "relu1": "model/quant_re_lu/Relu;model/quant_conv2d/BiasAdd;model/quant_conv2d_29/Conv2D;model/quant_conv2d/Conv2D;model/quant_conv2d/BiasAdd/ReadVariableOp",
-        "maxpool1": "model/quant_max_pooling2d/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv12": {
             "weight": "model/quant_conv2d_1/Conv2D;model/quant_conv2d_1/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_1/LastValueQuant_1/FakeQuantWithMinMaxVars",
@@ -27,7 +26,7 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d_5/LastValueQuant_1/FakeQuantWithMinMaxVars",
             "output_scale": "model/quant_conv2d_5/BiasAdd;model/quant_conv2d_7/Conv2D;model/quant_conv2d_5/Conv2D;model/quant_conv2d_5/LastValueQuant_1/FakeQuantWithMinMaxVars",
         },
-        "maxpool2": "model/quant_max_pooling2d_1/MaxPool",
+        "maxpool2": "model/quant_max_pooling2d/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv12_4": {
             "weight": "model/quant_conv2d_2/Conv2D;model/quant_conv2d_2/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_2/LastValueQuant_1/FakeQuantWithMinMaxVars",
@@ -54,7 +53,7 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d_10/LastValueQuant_1/FakeQuantWithMinMaxVars",
             "output_scale": "model/quant_conv2d_10/BiasAdd;model/quant_conv2d_7/Conv2D;model/quant_conv2d_10/Conv2D;model/quant_conv2d_10/LastValueQuant_1/FakeQuantWithMinMaxVars",
         },
-        "maxpool3": "model/quant_max_pooling2d_2/MaxPool",
+        "maxpool3": "model/quant_max_pooling2d_1/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv13_4": {
             "weight": "model/quant_conv2d_7/Conv2D;model/quant_conv2d_7/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_7/LastValueQuant_1/FakeQuantWithMinMaxVars",
@@ -70,7 +69,6 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d_11/BiasAdd/ReadVariableOp"
         },
         "relu1": "model/quant_re_lu_3/Relu;model/quant_conv2d_11/BiasAdd;model/quant_conv2d_11/Conv2D;model/quant_conv2d_11/BiasAdd/ReadVariableOp",
-        "maxpool1": "model/quant_max_pooling2d_3/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d_3/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv12": {
             "weight": "model/quant_conv2d_12/Conv2D;model/quant_conv2d_12/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_12/LastValueQuant_1/FakeQuantWithMinMaxVars",
@@ -91,7 +89,7 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d_16/LastValueQuant_1/FakeQuantWithMinMaxVars",
             "output_scale": "model/quant_conv2d_16/BiasAdd;model/quant_conv2d_18/Conv2D;model/quant_conv2d_16/Conv2D;model/quant_conv2d_16/LastValueQuant_1/FakeQuantWithMinMaxVars",
         },
-        "maxpool2": "model/quant_max_pooling2d_4/MaxPool",
+        "maxpool2": "model/quant_max_pooling2d_2/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d_2/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv12_4": {
             "weight": "model/quant_conv2d_13/Conv2D;model/quant_conv2d_13/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_13/LastValueQuant_1/FakeQuantWithMinMaxVars",
@@ -118,7 +116,7 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d_21/LastValueQuant_1/FakeQuantWithMinMaxVars",
             "output_scale": "model/quant_conv2d_21/BiasAdd;model/quant_conv2d_18/Conv2D;model/quant_conv2d_21/Conv2D;model/quant_conv2d_21/LastValueQuant_1/FakeQuantWithMinMaxVars",
         },
-        "maxpool3": "model/quant_max_pooling2d_5/MaxPool",
+        "maxpool3": "model/quant_max_pooling2d_3/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d_3/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv13_4": {
             "weight": "model/quant_conv2d_18/Conv2D;model/quant_conv2d_18/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_18/LastValueQuant_1/FakeQuantWithMinMaxVars",
@@ -134,7 +132,6 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d_22/BiasAdd/ReadVariableOp"
         },
         "relu1": "model/quant_re_lu_6/Relu;model/quant_conv2d_22/BiasAdd;model/quant_conv2d_22/Conv2D;model/quant_conv2d_22/BiasAdd/ReadVariableOp",
-        "maxpool1": "model/quant_max_pooling2d_6/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d_6/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv12": {
             "weight": "model/quant_conv2d_23/Conv2D;model/quant_conv2d_23/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_23/LastValueQuant_1/FakeQuantWithMinMaxVars",
@@ -155,7 +152,7 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d_27/LastValueQuant_1/FakeQuantWithMinMaxVars",
             "output_scale": "model/quant_conv2d_27/BiasAdd;model/quant_conv2d_29/Conv2D;model/quant_conv2d_27/Conv2D;model/quant_conv2d_27/LastValueQuant_1/FakeQuantWithMinMaxVars",
         },
-        "maxpool2": "model/quant_max_pooling2d_7/MaxPool",
+        "maxpool2": "model/quant_max_pooling2d_4/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d_4/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv12_4": {
             "weight": "model/quant_conv2d_24/Conv2D;model/quant_conv2d_24/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_24/LastValueQuant_1/FakeQuantWithMinMaxVars",
@@ -182,7 +179,7 @@ dict_all_layer_names = {
             "bias": "model/quant_conv2d_32/LastValueQuant_1/FakeQuantWithMinMaxVars",
             "output_scale": "model/quant_conv2d_32/BiasAdd;model/quant_conv2d_29/Conv2D;model/quant_conv2d_32/Conv2D;model/quant_conv2d_32/LastValueQuant_1/FakeQuantWithMinMaxVars",
         },
-        "maxpool3": "model/quant_max_pooling2d_8/MaxPool",
+        "maxpool3": "model/quant_max_pooling2d_5/MovingAvgQuantize/FakeQuantWithMinMaxVars;model/quant_add_1/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp;model/quant_max_pooling2d_5/MovingAvgQuantize/FakeQuantWithMinMaxVars/ReadVariableOp_1",
         "conv13_4": {
             "weight": "model/quant_conv2d_29/Conv2D;model/quant_conv2d_29/LastValueQuant/FakeQuantWithMinMaxVars",
             "bias": "model/quant_conv2d_29/LastValueQuant_1/FakeQuantWithMinMaxVars",
